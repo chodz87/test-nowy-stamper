@@ -84,18 +84,35 @@ def normalize_digits(s: str) -> str:
     return re.sub(r"[\s\-{}{}{}]".format(NBSP, NNBSP, THINSP), "", s)
 
 def extract_candidates(text: str):
+    """
+    Numery używane do przypisania stron do zleceń.
+    """
     import re
     normal = re.findall(r"\b\d{4,8}\b", text)
     fancy = re.findall(r"(?<!\d)(?:\d[\s\u00A0\u202F\u2009\-]?){4,9}(?!\d)", text)
     fancy = [normalize_digits(s) for s in fancy]
-    so = [normalize_digits(m.group(1)) for m in re.finditer(r"Sales\s*[\r\n ]*Order[\s:]*([0-9\s\u00A0\u202F\u2009\-]{4,12})", text, flags=re.I)]
+    so = [normalize_digits(m.group(1)) for m in re.finditer(
+        r"Sales\s*[\r\n ]*Order[\s:]*([0-9\s\u00A0\u202F\u2009\-]{4,12})",
+        text,
+        flags=re.I,
+    )]
     cands = normal + fancy + so
-    cands = [c for c in cands if c.isdigit() and 4 <= len(c) <= 8]
+    cands = [c for c in cands if c.isdigit() and 3 <= len(c) <= 9]
     out, seen = [], set()
     for c in cands:
         if c not in seen:
             out.append(c); seen.add(c)
     return out
+
+def extract_all_numbers_from_pdf(all_text: str):
+    """
+    Bardzo prosty skan po całym tekście PDF:
+    zwraca wszystkie sekwencje 3-9 cyfr.
+    To ma zapewnić, że numery takie jak 55667, 55226 itd.
+    na pewno trafią do raportu 'Z PDF-A NIEZNALEZIONE W EXCELU'.
+    """
+    nums = re.findall(r"(?<!\d)(\d{3,9})(?!\d)", all_text)
+    return {n for n in nums if n.isdigit()}
 
 def adaptive_crop_extra(text: str):
     lines = [ln for ln in (text or "").splitlines() if ln.strip()]
@@ -109,9 +126,7 @@ def make_overlay(width, height, header, footer, uwagi="", font_size=12, margin_m
     Nadruk w prawym dolnym rogu:
     - nagłówek (ZLECENIE / ZLECENIA)
     - stopka (ilość palet / przewoźnik)
-    - opcjonalnie linia z uwagami z Excela
-    Układ pozostaje bardzo zbliżony do wersji v1.6 (dwie główne linie),
-    trzecia linia z UWAGAMI jest dokładana niżej.
+    - opcjonalnie linia z uwagami z Excela (niepogrubiona)
     """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(width, height))
@@ -177,10 +192,12 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     groups, page_meta, page_text_cache = {}, {}, {}
     found_in_pdf = set()
     pdf_candidates_all = set()
+    all_text_parts = []
 
     for i, _ in enumerate(reader.pages):
         page_text = extract_text(io.BytesIO(pdf_bytes), page_numbers=[i]) or ""
         page_text_cache[i] = page_text
+        all_text_parts.append(page_text)
 
         cands = extract_candidates(page_text)
         for c in cands:
@@ -235,7 +252,7 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     base_crop_b = BASE_CROP_B*mm
 
     writer = PdfWriter()
-    writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.7b (pypdf, uwagi + poprawiony raport 2)"})
+    writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.7c (pypdf, uwagi + raport pełne numery)"})
 
     for gkey in ordered_keys:
         idxs = groups[gkey]
@@ -280,11 +297,11 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             base_page.merge_page(ov.pages[0])
 
     # --- RAPORT KOŃCOWY ---
-    # ZLECENIA Z EXCELA NIEZNALEZIONE W PDF
-    # i ZLECENIA Z PDF-A NIEZNALEZIONE W EXCELU
-    # liczymy teraz na podstawie WSZYSTKICH kandydatów z PDF (extract_candidates),
-    # żeby łapać także numery takie jak 55667, 55226 itp.
-    pdf_all = found_in_pdf.union(pdf_candidates_all)
+    # Korzystamy z bardzo prostego skanu całego PDF-a, żeby złapać wszystkie sekwencje cyfr.
+    full_text = "\n".join(all_text_parts)
+    pdf_all_extra = extract_all_numbers_from_pdf(full_text)
+
+    pdf_all = found_in_pdf.union(pdf_candidates_all).union(pdf_all_extra)
     if excel_numbers:
         excel_missing = sorted([n for n in excel_numbers if n not in pdf_all], key=lambda x: int(x))
     else:
@@ -306,7 +323,7 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     return out.getvalue()
 
 # ---- UI ----
-st.set_page_config(page_title="Kersia PDF Stamper v1.7b (Raport + UWAGI)", page_icon="🧰", layout="centered")
+st.set_page_config(page_title="Kersia PDF Stamper v1.7c (Raport + UWAGI)", page_icon="🧰", layout="centered")
 st.title("Kersia — PDF Stamper (raport braków + uwagi)")
 excel_file = st.file_uploader("Plik Excel:", type=["xlsx", "xlsm", "xls"])
 pdf_file = st.file_uploader("Plik PDF:", type=["pdf"])
