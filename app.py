@@ -188,10 +188,12 @@ def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
 def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     lookup, excel_numbers = read_excel_lookup(io.BytesIO(xlsx_bytes))
     reader = PdfReader(io.BytesIO(pdf_bytes))
+    # Pomiń pierwszą stronę PDF (zwykle strona z parametrami raportu)
     groups, page_meta, page_text_cache = {}, {}, {}
     found_in_pdf = set(); pdf_candidates_all = set()
 
-    for i, _ in enumerate(reader.pages):
+    # zaczynamy od strony 1 (index 1), strona 0 jest pomijana
+    for i in range(1, len(reader.pages)):
         page_text = extract_text(io.BytesIO(pdf_bytes), page_numbers=[i]) or ""
         page_text_cache[i] = page_text
         cands = extract_candidates(page_text)
