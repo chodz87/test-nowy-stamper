@@ -109,41 +109,46 @@ def adaptive_crop_extra(text: str):
 
 def make_overlay(width, height, header, footer, uwagi="", dok="", font_size=12, margin_mm=8):
     """
-    Nadruk:
-      1) nagłówek (ZLECENIE / ZLECENIA) w prawym dolnym rogu
-      2) stopka (ilość palet | przewoźnik) w prawym dolnym rogu
-      3) UWAGI po LEWEJ stronie, na wysokości informacji o zleceniu
-      4) opcjonalnie: "DOK: ..." (kto wpisał zlecenie) przy prawej krawędzi
+    Nadruk w prawym dolnym rogu:
+      - po PRAWEJ: nagłówek + stopka (ilość palet | przewoźnik)
+      - po LEWEJ: DOK (nad) oraz UWAGI (pod)
     """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(width, height))
+
+    m = margin_mm * mm
+
+    # --- prawa strona: nagłówek + stopka ---
     try:
         c.setFont("Helvetica-Bold", font_size)
     except Exception:
         c.setFont("Helvetica", font_size)
-    m = margin_mm * mm
 
-    # nagłówek i stopka po prawej
+    # nagłówek
     c.drawRightString(width - m, m + font_size + 1, header)
+
+    # stopka (ilość palet | przewoźnik)
     if footer:
         c.drawRightString(width - m, m, footer)
 
-    # UWAGI po LEWEJ stronie – wyrównane do lewego marginesu,
-    # na tej samej wysokości co stopka (footer)
-    if uwagi:
-        try:
-            c.setFont("Helvetica", font_size - 1)
-        except Exception:
-            c.setFont("Helvetica", font_size)
-        c.drawString(m, m, "uwagi: {}".format(strip_diacritics(uwagi)))
+    # --- lewa strona: DOK nad UWAGAMI ---
+    left_x = m
+    y = m + font_size + 1
 
-    # DOK pozostaje przy prawej krawędzi, pod stopką
     if dok:
         try:
             c.setFont("Helvetica", font_size - 1)
         except Exception:
             c.setFont("Helvetica", font_size)
-        c.drawRightString(width - m, m - font_size, "DOK: {}".format(strip_diacritics(dok)))
+        c.drawString(left_x, y, "DOK: {}".format(strip_diacritics(dok)))
+        y -= (font_size + 2)
+
+    if uwagi:
+        try:
+            c.setFont("Helvetica", font_size - 1)
+        except Exception:
+            c.setFont("Helvetica", font_size)
+        c.drawString(left_x, y, "uwagi: {}".format(strip_diacritics(uwagi)))
 
     c.save()
     return buf.getvalue()
@@ -189,11 +194,10 @@ def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
 def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     lookup, excel_numbers = read_excel_lookup(io.BytesIO(xlsx_bytes))
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    # Pomiń pierwszą stronę PDF (zwykle strona z parametrami raportu)
     groups, page_meta, page_text_cache = {}, {}, {}
     found_in_pdf = set(); pdf_candidates_all = set()
 
-    # zaczynamy od strony 1 (index 1), strona 0 jest pomijana
+    # pomijamy pierwszą stronę PDF (index 0)
     for i in range(1, len(reader.pages)):
         page_text = extract_text(io.BytesIO(pdf_bytes), page_numbers=[i]) or ""
         page_text_cache[i] = page_text
