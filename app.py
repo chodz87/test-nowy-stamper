@@ -200,98 +200,172 @@ def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
     return buf.getvalue()
 
 def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
+    """
+    Główna funkcja:
+    - pomija pierwszą stronę PDF (zwykle parametry raportu),
+    - dopasowuje strony do zleceń z Excela (oraz tworzy zlecenia "PDF-only"),
+    - stempluje strony (ZLECENIE, ilość, przewoźnik, DOK, UWAGI),
+    - na końcu dodaje stronę raportową z: ZLECENIA Z EXCELA NIEZNALEZIONE W PDF.
+    """
+    # Excel
     lookup, excel_numbers = read_excel_lookup(io.BytesIO(xlsx_bytes))
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    groups, page_meta, page_text_cache = {}, {}, {}
-    found_in_pdf = set(); pdf_candidates_all = set()
 
-    # pomijamy pierwszą stronę PDF (index 0)
+    # PDF wejściowy
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+
+    groups: dict[str, list[int]] = {}
+    page_meta: dict[int, tuple[str, str, str, str]] = {}
+    page_text_cache: dict[int, str] = {}
+
+    found_in_pdf: set[str] = set()
+    pdf_candidates_all: set[str] = set()
+
+    # --- przejście po stronach, pomijamy pierwszą (index 0) ---
     for i in range(1, len(reader.pages)):
         page_text = extract_text(io.BytesIO(pdf_bytes), page_numbers=[i]) or ""
         page_text_cache[i] = page_text
+
         cands = extract_candidates(page_text)
+
+        # statystyka dopasowanych numerów
         for c in cands:
             if c in excel_numbers:
                 found_in_pdf.add(c)
             else:
                 pdf_candidates_all.add(c)
+
         picked_excel = next((n for n in cands if n in excel_numbers), None)
         picked_any = picked_excel or (cands[0] if cands else None)
+
         mapped = lookup.get(picked_excel) if picked_excel else None
+
         if mapped:
             # lookup: numer -> (zlecenie, ilość palet, przewoźnik, uwagi, dok)
             if len(mapped) == 5:
                 z_full, il, pr, uw, dok = mapped
             else:
                 z_full, il, pr = mapped
-                uw = ""; dok = ""
+                uw = ""
+                dok = ""
+
             key = z_full
             header = ("ZLECENIA (laczone): {}".format(strip_diacritics(z_full))
                       if "+" in z_full else "ZLECENIE: {}".format(strip_diacritics(z_full)))
             footer = "ilosc palet: {} | przewoznik: {}".format(strip_diacritics(il), strip_diacritics(pr))
         elif picked_any:
-            key = picked_any; header = "ZLECENIE: {}".format(picked_any); footer = "(brak danych w Excelu)"; uw = ""; dok = ""
+            key = picked_any
+            header = "ZLECENIE: {}".format(picked_any)
+            footer = "(brak danych w Excelu)"
+            uw = ""
+            dok = ""
         else:
-            key = "_NO_ORDER_{}".format(i+1); header = "(nie znaleziono numeru zlecenia na tej stronie)"; footer = ""; uw = ""; dok = ""
-        groups.setdefault(key, []).append(i); page_meta[i] = (header, footer, uw, dok)
+            key = "_NO_ORDER_{}".format(i + 1)
+            header = "(nie znaleziono numeru zlecenia na tej stronie)"
+            footer = ""
+            uw = ""
+            dok = ""
 
+        groups.setdefault(key, []).append(i)
+        page_meta[i] = (header, footer, uw, dok)
 
+    # --- sortowanie grup po numerach zleceń ---
     def key_sort(k: str):
-        import re; nums = [int(x) for x in re.findall(r"\d+", k)]; return (min(nums) if nums else 10**9, k)
+        import re
+        nums = [int(x) for x in re.findall(r"\d+", k)]
+        return (min(nums) if nums else 10**9, k)
+
     ordered_keys = sorted(groups.keys(), key=key_sort)
 
+    # --- parametry strony wynikowej ---
     W, H = A4
-    margin_x = SIDE_MARGIN_MM * mm; top_margin = TOP_MARGIN_MM * mm
-    bot_stamp = STAMP_BOTTOM_MM * mm; gap = INTER_GAP_MM * mm
-    avail_w = W - 2*margin_x; avail_h = H - top_margin - bot_stamp
-    base_crop_l = BASE_CROP_L*mm; base_crop_r = BASE_CROP_R*mm
-    base_crop_t = BASE_CROP_T*mm; base_crop_b = BASE_CROP_B*mm
+    margin_x = SIDE_MARGIN_MM * mm
+    top_margin = TOP_MARGIN_MM * mm
+    bot_stamp = STAMP_BOTTOM_MM * mm
+    gap = INTER_GAP_MM * mm
 
-    writer = PdfWriter(); writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.6 (pypdf)"})
+    avail_w = W - 2 * margin_x
+    avail_h = H - top_margin - bot_stamp
+
+    base_crop_l = BASE_CROP_L * mm
+    base_crop_r = BASE_CROP_R * mm
+    base_crop_t = BASE_CROP_T * mm
+    base_crop_b = BASE_CROP_B * mm
+
+    writer = PdfWriter()
+    writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.6 (pypdf)"})
+
+    # --- składanie stron na arkusze ---
     for gkey in ordered_keys:
         idxs = groups[gkey]
+
         for start in range(0, len(idxs), max_per_sheet):
-            batch = idxs[start:start+max_per_sheet]
-            items, total_h = [], 0.0
+            batch = idxs[start:start + max_per_sheet]
+
+            items = []
+            total_h = 0.0
+
+            # najpierw policz skalowanie dla wszystkich stron w batchu
             for idx in batch:
                 src = reader.pages[idx]
-                sw = float(src.mediabox.width); sh = float(src.mediabox.height)
+                sw = float(src.mediabox.width)
+                sh = float(src.mediabox.height)
+
                 ex_l, ex_r, ex_t, ex_b = adaptive_crop_extra(page_text_cache[idx])
-                cl = base_crop_l + ex_l; cr = base_crop_r + ex_r
-                ct = base_crop_t + ex_t; cb = base_crop_b + ex_b
-                cw = max(10.0, sw - cl - cr); ch = max(10.0, sh - ct - cb)
-                s  = avail_w / cw; dh = s * ch
-                items.append((idx, cl, cr, ct, cb, s, dh)); total_h += dh
-            total_h += gap * max(0, len(batch)-1)
+                cl = base_crop_l + ex_l
+                cr = base_crop_r + ex_r
+                ct = base_crop_t + ex_t
+                cb = base_crop_b + ex_b
+
+                cw = max(10.0, sw - cl - cr)
+                ch = max(10.0, sh - ct - cb)
+
+                s = avail_w / cw
+                dh = s * ch
+
+                items.append((idx, cl, cr, ct, cb, s, dh))
+                total_h += dh
+
+            total_h += gap * max(0, len(batch) - 1)
             down = min(1.0, avail_h / total_h) if total_h > 0 else 1.0
 
-            writer.add_blank_page(width=W, height=H); base_page = writer.pages[-1]
+            writer.add_blank_page(width=W, height=H)
+            base_page = writer.pages[-1]
+
             y = H - top_margin
+
             for (idx, cl, cr, ct, cb, s, dh) in items:
-                s *= down; dh *= down
-                x = margin_x - s * cl; y2 = y - dh
+                s *= down
+                dh *= down
+
+                x = margin_x - s * cl
+                y2 = y - dh
+
                 tmp = PageObject.create_blank_page(width=W, height=H)
                 tmp.merge_page(reader.pages[idx])
+
                 T = Transformation().translate(-cl, -cb).scale(s, s).translate(x, y2)
-                tmp.add_transformation(T); base_page.merge_page(tmp)
+                tmp.add_transformation(T)
+                base_page.merge_page(tmp)
+
                 y = y2 - gap
 
+            # nakładka z opisem (nagłówek, footer, DOK, UWAGI)
             ov = PdfReader(io.BytesIO(make_overlay(W, H, *page_meta[batch[0]])))
             base_page.merge_page(ov.pages[0])
 
-# wyliczamy zlecenia z EXCELA, których nie znaleziono w PDF
-excel_missing = sorted(list(excel_numbers - found_in_pdf), key=lambda x: int(x)) if excel_numbers else []
+    # --- raport: zlecenia z Excela nie znalezione w PDF ---
+    excel_missing = sorted(list(excel_numbers - found_in_pdf), key=lambda x: int(x)) if excel_numbers else []
 
-# jeśli są brakujące zlecenia z Excela, dokładamy stronę raportową na końcu
-if excel_missing:
-    sum_pdf = PdfReader(io.BytesIO(make_summary_page(W, H, excel_missing, [])))
-    for p in sum_pdf.pages:
-        writer.add_page(p)
+    if excel_missing:
+        rep_pdf = PdfReader(io.BytesIO(make_summary_page(W, H, excel_missing, [])))
+        for p in rep_pdf.pages:
+            writer.add_page(p)
 
-buf = io.BytesIO()
-writer.write(buf)
-buf.seek(0)
-return buf.getvalue()
+    # --- wynik ---
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    return out.getvalue()
 
 
 
