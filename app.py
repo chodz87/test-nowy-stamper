@@ -122,7 +122,7 @@ def make_overlay(width, height, header, footer, uwagi="", dok="", font_size=12, 
     try:
         c.setFont("Helvetica-Bold", font_size)
     except Exception:
-        c.setFont("Helvetica", font_size)
+        c.setFont("Helvetica-Bold", font_size)
 
     # nagłówek
     c.drawRightString(width - m, m + font_size + 1, header)
@@ -135,20 +135,24 @@ def make_overlay(width, height, header, footer, uwagi="", dok="", font_size=12, 
     left_x = m
     y = m + font_size + 1
 
+    # DOK (bez polskich znaków)
     if dok:
         try:
-            c.setFont("Helvetica", font_size - 1)
+            c.setFont("Helvetica-Bold", font_size - 1)
         except Exception:
-            c.setFont("Helvetica", font_size)
-        c.drawString(left_x, y, "DOK: {}".format(strip_diacritics(dok)))
+            c.setFont("Helvetica-Bold", font_size)
+        dok_clean = strip_diacritics(dok)
+        c.drawString(left_x, y, "DOK: {}".format(dok_clean))
         y -= (font_size + 2)
 
+    # UWAGI (pogrubione, wielkie litery, bez polskich znaków)
     if uwagi:
         try:
-            c.setFont("Helvetica", font_size - 1)
+            c.setFont("Helvetica-Bold", font_size - 1)
         except Exception:
-            c.setFont("Helvetica", font_size)
-        c.drawString(left_x, y, "uwagi: {}".format(strip_diacritics(uwagi)))
+            c.setFont("Helvetica-Bold", font_size)
+        uw_clean = strip_diacritics(uwagi).upper()
+        c.drawString(left_x, y, "UWAGI: {}".format(uw_clean))
 
     c.save()
     return buf.getvalue()
