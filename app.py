@@ -97,9 +97,13 @@ def is_effectively_blank_page(text: str) -> bool:
     import re
     if not text:
         return True
-    t = " ".join(text.split()).lower()
+    t_raw = " ".join(text.split()).lower()
+    # jeśli na stronie jest wyraźny komunikat 'end of report' traktujemy ją jako pustą
+    if "end of report" in t_raw:
+        return True
+    t = t_raw
     boiler = [
-        "movement request pick slip","report date","page ","end of report",
+        "movement request pick slip","report date","page ",
         "oracle","niepruszewo","input parameters"
     ]
     for b in boiler:
