@@ -130,6 +130,8 @@ def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
     c.save(); return buf.getvalue()
 
 def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
+    unknown_pdf_orders = []  # strony bez odczytanego numeru zlecenia
+
     lookup, excel_numbers = read_excel_lookup(io.BytesIO(xlsx_bytes))
     reader = PdfReader(io.BytesIO(pdf_bytes))
     groups, page_meta, page_text_cache = {}, {}, {}
@@ -154,6 +156,7 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             key = picked; header = "ZLECENIE: {}".format(picked); footer = "(brak danych w Excelu)"
         else:
             key = "_NO_ORDER_{}".format(i+1); header = "(nie znaleziono numeru zlecenia na tej stronie)"; footer = ""
+            unknown_pdf_orders.append(f"STRONA_{i+1}")
         groups.setdefault(key, []).append(i); page_meta[i] = (header, footer)
 
     def key_sort(k: str):
@@ -199,8 +202,10 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             ov = PdfReader(io.BytesIO(make_overlay(W, H, *page_meta[batch[0]])))
             base_page.merge_page(ov.pages[0])
 
-    excel_missing = sorted(list(excel_numbers - found_in_pdf), key=lambda x: int(x)) if excel_numbers else []
+        excel_missing = sorted(list(excel_numbers - found_in_pdf), key=lambda x: int(x)) if excel_numbers else []
     pdf_only = sorted(list(pdf_candidates_all - excel_numbers), key=lambda x: int(x)) if pdf_candidates_all else []
+    # dodajemy strony, na których nie udało się odczytać numeru zlecenia
+    pdf_only.extend(unknown_pdf_orders)
     rep = PdfReader(io.BytesIO(make_summary_page(W, H, excel_missing, pdf_only)))
     writer.add_page(rep.pages[0])
 
