@@ -155,49 +155,41 @@ def make_overlay(width, height, header, footer, uwagi="", dok="", font_size=12, 
 
 
 def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
-    """
-    Raport końcowy:
-    - pokazujemy tylko: ZLECENIA Z EXCELA NIEZNALEZIONE W PDF
-    """
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=(width, height))
+    buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=(width, height))
     W, H = width, height
-    try:
-        c.setFont("Helvetica-Bold", 16)
-    except Exception:
-        c.setFont("Helvetica", 16)
-
+    try: c.setFont("Helvetica-Bold", 16)
+    except Exception: c.setFont("Helvetica", 16)
     c.drawString(30, H-40, "RAPORT POROWNANIA DANYCH")
+
     y = H-80
-
-    # sekcja: ZLECENIA Z EXCELA NIEZNALEZIONE W PDF
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(30, y, "ZLECENIA Z EXCELA NIEZNALEZIONE W PDF:")
-    y -= 20
-
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(30, y, "ZLECENIE")
-    y -= 12
-
-    c.setLineWidth(0.5)
-    c.line(30, y, W-30, y)
-    y -= 10
-
+    c.setFont("Helvetica-Bold", 12); c.drawString(30, y, "ZLECENIA Z EXCELA NIEZNALEZIONE W PDF:")
+    y -= 20; c.setFont("Helvetica-Bold", 10); c.drawString(30, y, "ZLECENIE"); 
+    y -= 12; c.setLineWidth(0.5); c.line(30, y, W-30, y); y -= 10
     c.setFont("Helvetica", 10)
     if not missing_from_pdf:
-        c.drawString(30, y, "(brak)")
-        y -= 16
+        c.drawString(30, y, "(brak)"); y -= 16
     else:
         for num in missing_from_pdf:
-            c.drawString(30, y, str(num))
-            y -= 14
-            if y < 60:
-                c.showPage()
-                y = H-60
-                c.setFont("Helvetica", 10)
+            c.drawString(30, y, str(num)); y -= 14
+            if y < 80:
+                c.showPage(); y = H-60; c.setFont("Helvetica", 10)
 
-    c.save()
-    return buf.getvalue()
+    if y < 140:
+        c.showPage(); y = H-60
+
+    c.setFont("Helvetica-Bold", 12); c.drawString(30, y, "ZLECENIA Z PDF-A NIEZNALEZIONE W EXCELU:")
+    y -= 20; c.setFont("Helvetica-Bold", 10); c.drawString(30, y, "ZLECENIE")
+    y -= 12; c.setLineWidth(0.5); c.line(30, y, W-30, y); y -= 10
+    c.setFont("Helvetica", 10)
+    if not missing_from_excel:
+        c.drawString(30, y, "(brak)"); y -= 16
+    else:
+        for num in missing_from_excel:
+            c.drawString(30, y, str(num)); y -= 14
+            if y < 60:
+                c.showPage(); y = H-60; c.setFont("Helvetica", 10)
+
+    c.save(); return buf.getvalue()
 
 def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     lookup, excel_numbers = read_excel_lookup(io.BytesIO(xlsx_bytes))
@@ -279,19 +271,8 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             ov = PdfReader(io.BytesIO(make_overlay(W, H, *page_meta[batch[0]])))
             base_page.merge_page(ov.pages[0])
 
-# wyliczamy zlecenia z EXCELA, których nie znaleziono w PDF
-excel_missing = sorted(list(excel_numbers - found_in_pdf), key=lambda x: int(x)) if excel_numbers else []
-
-# jeśli są brakujące zlecenia z Excela, dokładamy stronę raportową na końcu
-if excel_missing:
-    sum_pdf = PdfReader(io.BytesIO(make_summary_page(W, H, excel_missing, [])))
-    for p in sum_pdf.pages:
-        writer.add_page(p)
-
-buf = io.BytesIO()
-writer.write(buf)
-buf.seek(0)
-return buf.getvalue()
+    buf = io.BytesIO(); writer.write(buf); buf.seek(0)
+    return buf.getvalue()
 
 
 # ---- UI ----
