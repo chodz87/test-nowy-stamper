@@ -36,7 +36,7 @@ def read_excel_lookup(file_like):
     """
     Odczyt Excela:
       - wymagane kolumny: ZLECENIE, ilość palet, przewoźnik
-      - opcjonalne kolumny: UWAGI, DOK (osoba wprowadzająca zlecenie)
+      - opcjonalne kolumny: UWAGI, DOK
     Zwraca:
       lookup: numer -> (zlecenie, ilość palet, przewoźnik, uwagi, dok)
       all_nums: zbiór wszystkich numerów z kolumny ZLECENIE
@@ -52,8 +52,8 @@ def read_excel_lookup(file_like):
     z_col   = headers.get("zlecenie")
     ilo_col = headers.get("ilośc palet") or headers.get("ilosc palet") or headers.get("ilość palet")
     pr_col  = headers.get("przewoźnik") or headers.get("przewoznik")
-    uw_col  = headers.get("uwagi")
-    dok_col = headers.get("dok")
+    uw_col  = headers.get("uwagi")   # opcjonalne
+    dok_col = headers.get("dok")     # opcjonalne
 
     if not z_col or not ilo_col or not pr_col:
         raise ValueError("Excel musi mieć kolumny: ZLECENIE, ilość palet, przewoźnik (nagłówki w 1. wierszu).")
@@ -88,7 +88,6 @@ def normalize_digits(s: str) -> str:
     import re
     return re.sub(r"[\s\-{}{}{}]".format(NBSP, NNBSP, THINSP), "", s)
 
-
 def extract_candidates(text: str):
     import re
     normal = re.findall(r"\b\d{4,8}\b", text)
@@ -118,19 +117,19 @@ def make_overlay(width, height, header, footer, uwagi="", dok="", font_size=12, 
     UWAGI i DOK są zwykłym tekstem (niepogrubione).
     """
     buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=(width, height))
-    try:
+    try: 
         c.setFont("Helvetica-Bold", font_size)
     except Exception:
         c.setFont("Helvetica", font_size)
     m = margin_mm * mm
 
-    # 1) nagłówek
+    # nagłówek
     c.drawRightString(width - m, m + font_size + 1, header)
-    # 2) stopka
+    # stopka
     if footer:
         c.drawRightString(width - m, m, footer)
 
-    # 3) uwagi
+    # dodatkowe linie
     y = m - (font_size + 1)
     if uwagi:
         try:
@@ -139,8 +138,6 @@ def make_overlay(width, height, header, footer, uwagi="", dok="", font_size=12, 
             c.setFont("Helvetica", font_size)
         c.drawRightString(width - m, y, "uwagi: {}".format(strip_diacritics(uwagi)))
         y -= font_size
-
-    # 4) DOK
     if dok:
         try:
             c.setFont("Helvetica", font_size - 1)
@@ -189,136 +186,84 @@ def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
     c.save(); return buf.getvalue()
 
 def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
-    """
-    Główna logika:
-    - wczytuje Excela i PDF,
-    - przypisuje każdej stronie PDF odpowiednie zlecenie z Excela,
-    - nakłada stempel z: ZLECENIE, ilość palet, przewoźnik, UWAGI, DOK (jeśli są),
-    - NIE generuje dodatkowej strony raportowej.
-    """
     lookup, excel_numbers = read_excel_lookup(io.BytesIO(xlsx_bytes))
     reader = PdfReader(io.BytesIO(pdf_bytes))
+    groups, page_meta, page_text_cache = {}, {}, {}
+    found_in_pdf = set(); pdf_candidates_all = set()
 
-    groups = {}
-    page_meta = {}
-    page_text_cache = {}
-
-    # --- przypisanie stron do zleceń ---
     for i, _ in enumerate(reader.pages):
         page_text = extract_text(io.BytesIO(pdf_bytes), page_numbers=[i]) or ""
         page_text_cache[i] = page_text
-
         cands = extract_candidates(page_text)
+        for c in cands:
+            if c in excel_numbers: found_in_pdf.add(c)
+            else: pdf_candidates_all.add(c)
         picked = next((n for n in cands if n in excel_numbers), None)
         mapped = lookup.get(picked) if picked else None
-
         if mapped:
-            # lookup: numer -> (zlecenie, ilość, przewoźnik, uwagi, dok)
+            # lookup: numer -> (zlecenie, ilość palet, przewoźnik, uwagi, dok)
             if len(mapped) == 5:
                 z_full, il, pr, uw, dok = mapped
             else:
                 z_full, il, pr = mapped
-                uw = ""
-                dok = ""
+                uw = ""; dok = ""
             key = z_full
             header = ("ZLECENIA (laczone): {}".format(strip_diacritics(z_full))
                       if "+" in z_full else "ZLECENIE: {}".format(strip_diacritics(z_full)))
             footer = "ilosc palet: {} | przewoznik: {}".format(strip_diacritics(il), strip_diacritics(pr))
         elif picked:
-            key = picked
-            header = "ZLECENIE: {}".format(picked)
-            footer = "(brak danych w Excelu)"
-            uw = ""
-            dok = ""
+            key = picked; header = "ZLECENIE: {}".format(picked); footer = "(brak danych w Excelu)"; uw = ""; dok = ""
         else:
-            key = "_NO_ORDER_{}".format(i+1)
-            header = "(nie znaleziono numeru zlecenia na tej stronie)"
-            footer = ""
-            uw = ""
-            dok = ""
-
-        groups.setdefault(key, []).append(i)
-        page_meta[i] = (header, footer, uw, dok)
+            key = "_NO_ORDER_{}".format(i+1); header = "(nie znaleziono numeru zlecenia na tej stronie)"; footer = ""; uw = ""; dok = ""
+        groups.setdefault(key, []).append(i); page_meta[i] = (header, footer, uw, dok)
 
     def key_sort(k: str):
-        import re
-        nums = [int(x) for x in re.findall(r"\d+", k)]
-        return (min(nums) if nums else 10**9, k)
-
+        import re; nums = [int(x) for x in re.findall(r"\d+", k)]; return (min(nums) if nums else 10**9, k)
     ordered_keys = sorted(groups.keys(), key=key_sort)
 
-    # --- układ stron na arkuszach A4 ---
     W, H = A4
-    margin_x = SIDE_MARGIN_MM * mm
-    top_margin = TOP_MARGIN_MM * mm
-    bot_stamp = STAMP_BOTTOM_MM * mm
-    gap = INTER_GAP_MM * mm
-    avail_w = W - 2 * margin_x
-    avail_h = H - top_margin - bot_stamp
-    base_crop_l = BASE_CROP_L * mm
-    base_crop_r = BASE_CROP_R * mm
-    base_crop_t = BASE_CROP_T * mm
-    base_crop_b = BASE_CROP_B * mm
+    margin_x = SIDE_MARGIN_MM * mm; top_margin = TOP_MARGIN_MM * mm
+    bot_stamp = STAMP_BOTTOM_MM * mm; gap = INTER_GAP_MM * mm
+    avail_w = W - 2*margin_x; avail_h = H - top_margin - bot_stamp
+    base_crop_l = BASE_CROP_L*mm; base_crop_r = BASE_CROP_R*mm
+    base_crop_t = BASE_CROP_T*mm; base_crop_b = BASE_CROP_B*mm
 
-    writer = PdfWriter()
-    writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.6 (pypdf)"})
-
+    writer = PdfWriter(); writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.6 (pypdf)"})
     for gkey in ordered_keys:
         idxs = groups[gkey]
         for start in range(0, len(idxs), max_per_sheet):
-            batch = idxs[start:start + max_per_sheet]
-            items = []
-            total_h = 0.0
-
+            batch = idxs[start:start+max_per_sheet]
+            items, total_h = [], 0.0
             for idx in batch:
                 src = reader.pages[idx]
-                sw = float(src.mediabox.width)
-                sh = float(src.mediabox.height)
+                sw = float(src.mediabox.width); sh = float(src.mediabox.height)
                 ex_l, ex_r, ex_t, ex_b = adaptive_crop_extra(page_text_cache[idx])
-                cl = base_crop_l + ex_l
-                cr = base_crop_r + ex_r
-                ct = base_crop_t + ex_t
-                cb = base_crop_b + ex_b
-                cw = max(10.0, sw - cl - cr)
-                ch = max(10.0, sh - ct - cb)
-                s = avail_w / cw
-                dh = s * ch
-                items.append((idx, cl, cr, ct, cb, s, dh))
-                total_h += dh
-
-            total_h += gap * max(0, len(batch) - 1)
+                cl = base_crop_l + ex_l; cr = base_crop_r + ex_r
+                ct = base_crop_t + ex_t; cb = base_crop_b + ex_b
+                cw = max(10.0, sw - cl - cr); ch = max(10.0, sh - ct - cb)
+                s  = avail_w / cw; dh = s * ch
+                items.append((idx, cl, cr, ct, cb, s, dh)); total_h += dh
+            total_h += gap * max(0, len(batch)-1)
             down = min(1.0, avail_h / total_h) if total_h > 0 else 1.0
 
-            writer.add_blank_page(width=W, height=H)
-            base_page = writer.pages[-1]
+            writer.add_blank_page(width=W, height=H); base_page = writer.pages[-1]
             y = H - top_margin
-
             for (idx, cl, cr, ct, cb, s, dh) in items:
-                s *= down
-                dh *= down
-                x = margin_x - s * cl
-                y2 = y - dh
+                s *= down; dh *= down
+                x = margin_x - s * cl; y2 = y - dh
                 tmp = PageObject.create_blank_page(width=W, height=H)
                 tmp.merge_page(reader.pages[idx])
                 T = Transformation().translate(-cl, -cb).scale(s, s).translate(x, y2)
-                tmp.add_transformation(T)
-                base_page.merge_page(tmp)
+                tmp.add_transformation(T); base_page.merge_page(tmp)
                 y = y2 - gap
 
             ov = PdfReader(io.BytesIO(make_overlay(W, H, *page_meta[batch[0]])))
             base_page.merge_page(ov.pages[0])
 
-    # bez dodatkowej strony raportowej – tylko ostemplowane strony
-    buf = io.BytesIO()
-    writer.write(buf)
-    buf.seek(0)
-    r2 = PdfReader(buf, strict=False)
-    w2 = PdfWriter()
-    for p in r2.pages:
-        w2.add_page(p)
-    out = io.BytesIO()
-    w2.write(out)
-    return out.getvalue()
+    buf = io.BytesIO(); writer.write(buf); buf.seek(0)
+    return buf.getvalue()
+
+
 # ---- UI ----
 st.set_page_config(page_title="Kersia PDF Stamper v1.6 (Raport)", page_icon="🧰", layout="centered")
 st.title("Kersia — PDF Stamper (raport braków)")
