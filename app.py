@@ -64,17 +64,36 @@ def normalize_digits(s: str) -> str:
     import re
     return re.sub(r"[\s\-{}{}{}]".format(NBSP, NNBSP, THINSP), "", s)
 
+
 def extract_candidates(text: str):
     import re
     normal = re.findall(r"\b\d{4,8}\b", text)
     fancy = re.findall(r"(?<!\d)(?:\d[\s\u00A0\u202F\u2009\-]?){4,9}(?!\d)", text)
     fancy = [normalize_digits(s) for s in fancy]
-    so = [normalize_digits(m.group(1)) for m in re.finditer(r"Sales\s*[\r\n ]*Order[\s:]*([0-9\s\u00A0\u202F\u2009\-]{4,12})", text, flags=re.I)]
+    so = [normalize_digits(m.group(1)) for m in re.finditer(r"Sa...er[\s:]*([0-9\s\u00A0\u202F\u2009\-]{4,12})", text, flags=re.I)]
     cands = normal + fancy + so
     cands = [c for c in cands if c.isdigit() and 4 <= len(c) <= 8]
     out, seen = [], set()
     for c in cands:
-        if c not in seen: out.append(c); seen.add(c)
+        if c not in seen:
+            out.append(c); seen.add(c)
+    return out
+
+def extract_sales_orders(text: str):
+    """
+    Wyciąga numery Sales Order z tekstu (np. 'Sales Order 55667').
+    Bardzo tolerancyjny wzorzec: dopuszcza spacje/nowe linie pomiędzy.
+    """
+    import re
+    pattern = re.compile(
+        r"Sales\s*[^0-9A-Za-z]{0,3}\s*Order[^0-9]{0,10}([0-9\s\u00A0\u202F\u2009\-]{3,12})",
+        re.IGNORECASE,
+    )
+    out = []
+    for m in pattern.finditer(text):
+        num = normalize_digits(m.group(1))
+        if num.isdigit() and 3 <= len(num) <= 9:
+            out.append(num)
     return out
 
 def adaptive_crop_extra(text: str):
@@ -130,16 +149,24 @@ def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
     c.save(); return buf.getvalue()
 
 def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
-    unknown_pdf_orders = []  # strony bez odczytanego numeru zlecenia
-
     lookup, excel_numbers = read_excel_lookup(io.BytesIO(xlsx_bytes))
     reader = PdfReader(io.BytesIO(pdf_bytes))
     groups, page_meta, page_text_cache = {}, {}, {}
     found_in_pdf = set(); pdf_candidates_all = set()
+    sales_orders_all = set(); sales_orders_by_page = {}; unknown_pdf_pages = []
 
     for i, _ in enumerate(reader.pages):
         page_text = extract_text(io.BytesIO(pdf_bytes), page_numbers=[i]) or ""
         page_text_cache[i] = page_text
+        # numery Sales Order z tej strony
+        so_nums = extract_sales_orders(page_text)
+        sales_orders_by_page[i] = so_nums
+        for n in so_nums:
+            sales_orders_all.add(n)
+            if n in excel_numbers:
+                found_in_pdf.add(n)
+            else:
+                pdf_candidates_all.add(n)
         cands = extract_candidates(page_text)
         for c in cands:
             if c in excel_numbers: found_in_pdf.add(c)
@@ -155,8 +182,7 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
         elif picked:
             key = picked; header = "ZLECENIE: {}".format(picked); footer = "(brak danych w Excelu)"
         else:
-            key = "_NO_ORDER_{}".format(i+1); header = "(nie znaleziono numeru zlecenia na tej stronie)"; footer = ""
-            unknown_pdf_orders.append(f"STRONA_{i+1}")
+            key = "_NO_ORDER_{}".format(i+1); header = "(nie znaleziono numeru zlecenia na tej stronie)"; footer = ""; unknown_pdf_pages.append(i+1)
         groups.setdefault(key, []).append(i); page_meta[i] = (header, footer)
 
     def key_sort(k: str):
@@ -202,10 +228,11 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             ov = PdfReader(io.BytesIO(make_overlay(W, H, *page_meta[batch[0]])))
             base_page.merge_page(ov.pages[0])
 
-        excel_missing = sorted(list(excel_numbers - found_in_pdf), key=lambda x: int(x)) if excel_numbers else []
-    pdf_only = sorted(list(pdf_candidates_all - excel_numbers), key=lambda x: int(x)) if pdf_candidates_all else []
-    # dodajemy strony, na których nie udało się odczytać numeru zlecenia
-    pdf_only.extend(unknown_pdf_orders)
+    # do raportu używamy TYLKO numerów Sales Order
+    excel_missing = sorted([n for n in excel_numbers if n not in sales_orders_all], key=lambda x: int(x)) if excel_numbers else []
+    pdf_only = sorted([n for n in sales_orders_all if n not in excel_numbers], key=lambda x: int(x))
+    # strony, na których nie udało się odczytać numeru – dodajemy jako STRONA_X
+    pdf_only.extend([f"STRONA_{p}" for p in unknown_pdf_pages])
     rep = PdfReader(io.BytesIO(make_summary_page(W, H, excel_missing, pdf_only)))
     writer.add_page(rep.pages[0])
 
