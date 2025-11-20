@@ -109,43 +109,44 @@ def adaptive_crop_extra(text: str):
 
 def make_overlay(width, height, header, footer, uwagi="", dok="", font_size=12, margin_mm=8):
     """
-    Nadruk w prawym dolnym rogu:
-      1) nagłówek (ZLECENIE / ZLECENIA)
-      2) stopka (ilość palet | przewoźnik)
-      3) opcjonalnie: "uwagi: ..."
-      4) opcjonalnie: "DOK: ..." (kto wpisał zlecenie)
-    UWAGI i DOK są zwykłym tekstem (niepogrubione).
+    Nadruk:
+      1) nagłówek (ZLECENIE / ZLECENIA) w prawym dolnym rogu
+      2) stopka (ilość palet | przewoźnik) w prawym dolnym rogu
+      3) UWAGI po LEWEJ stronie, na wysokości informacji o zleceniu
+      4) opcjonalnie: "DOK: ..." (kto wpisał zlecenie) przy prawej krawędzi
     """
-    buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=(width, height))
-    try: 
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(width, height))
+    try:
         c.setFont("Helvetica-Bold", font_size)
     except Exception:
         c.setFont("Helvetica", font_size)
     m = margin_mm * mm
 
-    # nagłówek
+    # nagłówek i stopka po prawej
     c.drawRightString(width - m, m + font_size + 1, header)
-    # stopka
     if footer:
         c.drawRightString(width - m, m, footer)
 
-    # dodatkowe linie
-    y = m - (font_size + 1)
+    # UWAGI po LEWEJ stronie – wyrównane do lewego marginesu,
+    # na tej samej wysokości co stopka (footer)
     if uwagi:
         try:
             c.setFont("Helvetica", font_size - 1)
         except Exception:
             c.setFont("Helvetica", font_size)
-        c.drawRightString(width - m, y, "uwagi: {}".format(strip_diacritics(uwagi)))
-        y -= font_size
+        c.drawString(m, m, "uwagi: {}".format(strip_diacritics(uwagi)))
+
+    # DOK pozostaje przy prawej krawędzi, pod stopką
     if dok:
         try:
             c.setFont("Helvetica", font_size - 1)
         except Exception:
             c.setFont("Helvetica", font_size)
-        c.drawRightString(width - m, y, "DOK: {}".format(strip_diacritics(dok)))
+        c.drawRightString(width - m, m - font_size, "DOK: {}".format(strip_diacritics(dok)))
 
-    c.save(); return buf.getvalue()
+    c.save()
+    return buf.getvalue()
 
 
 def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
