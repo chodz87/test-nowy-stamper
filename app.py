@@ -1,227 +1,345 @@
-import io, re
-from datetime import datetime
+import io
+import os
+import re
+from datetime import datetime, date
+from typing import Any, Dict, List, Tuple, Set
+
 import streamlit as st
 from openpyxl import load_workbook
-from pdfminer.high_level import extract_text
+from PyPDF2 import PdfReader, PdfWriter
+from PyPDF2._page import PageObject
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
-from pypdf import PdfReader, PdfWriter, Transformation
-from pypdf._page import PageObject
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
-# ---- Config ----
-SIDE_MARGIN_MM = 2
-TOP_MARGIN_MM = 4
-STAMP_BOTTOM_MM = 12
-INTER_GAP_MM = 1
+st.set_page_config(page_title="Kersia PDF Stamper", page_icon="🧰", layout="centered")
+st.title("Kersia — PDF Stamper (wersja z raportem i uwagami)")
 
-BASE_CROP_L = 6
-BASE_CROP_R = 6
-BASE_CROP_T = 8
-BASE_CROP_B = 8
 
-LOW_TEXT_LINES = 4
-SHORT_TEXT_CHARS = 80
-EXTRA_CROP_LR = 14
-EXTRA_CROP_T  = 18
-EXTRA_CROP_B  = 28
+# ----------------------- POMOCNICZE -----------------------
 
-def strip_diacritics(s: str) -> str:
-    import unicodedata
-    if s is None:
+def _coerce_int(value: Any) -> int:
+    """Bezpieczne rzutowanie na int (dla ilości palet)."""
+    if value is None:
+        return 0
+    if isinstance(value, (datetime, date)):
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return 0
+        return int(round(value))
+    s = str(value).strip()
+    if not s:
+        return 0
+    m = re.search(r"-?\d+", s.replace(",", "."))
+    return int(m.group(0)) if m else 0
+
+
+def _to_str(v: Any) -> str:
+    if v is None:
         return ""
-    return "".join(c for c in unicodedata.normalize("NFKD", str(s)) if ord(c) < 128)
+    if isinstance(v, (datetime, date)):
+        return v.strftime("%Y-%m-%d")
+    return str(v)
 
-def read_excel_lookup(file_like):
-    wb = load_workbook(file_like, data_only=True); ws = wb.active
-    headers = {}
-    for col in range(1, ws.max_column + 1):
-        v = ws.cell(row=1, column=col).value
-        if v is None: continue
-        headers[str(v).strip().lower()] = col
-    z_col = headers.get("zlecenie")
-    ilo_col = headers.get("ilośc palet") or headers.get("ilosc palet") or headers.get("ilość palet")
-    pr_col = headers.get("przewoźnik") or headers.get("przewoznik")
-    if not z_col or not ilo_col or not pr_col:
-        raise ValueError("Excel musi mieć kolumny: ZLECENIE, ilość palet, przewoźnik (nagłówki w 1. wierszu).")
-    lookup = {}; all_nums = set()
-    for row in range(2, ws.max_row + 1):
-        z = ws.cell(row=row, column=z_col).value
-        il = ws.cell(row=row, column=ilo_col).value
-        pr = ws.cell(row=row, column=pr_col).value
-        z = "" if z is None else str(z).strip()
-        il = "" if il is None else str(il).strip()
-        pr = "" if pr is None else str(pr).strip()
-        parts = [p.strip() for p in re.split(r"[+;,/\s]+", z) if p.strip()]
-        for p in parts:
-            p2 = "".join(ch for ch in p if ch.isdigit())
-            if p2.isdigit():
-                all_nums.add(p2); lookup[p2] = (z, il, pr)
-    return lookup, all_nums
 
-NBSP = "\u00A0"; NNBSP = "\u202F"; THINSP = "\u2009"
-def normalize_digits(s: str) -> str:
-    import re
-    return re.sub(r"[\s\-{}{}{}]".format(NBSP, NNBSP, THINSP), "", s)
+def _parse_excel(excel_bytes: bytes) -> Tuple[List[Dict[str, Any]], Set[str]]:
+    """
+    Parsuje Excela i zwraca:
+    - listę wierszy: dict z kluczami: zlecenie, ilosc, przewoznik, uwagi
+    - zbiór wszystkich numerów zleceń (string)
+    """
+    wb = load_workbook(io.BytesIO(excel_bytes), data_only=True)
+    ws = wb.active
 
-def extract_candidates(text: str):
-    import re
-    normal = re.findall(r"\b\d{4,8}\b", text)
-    fancy = re.findall(r"(?<!\d)(?:\d[\s\u00A0\u202F\u2009\-]?){4,9}(?!\d)", text)
-    fancy = [normalize_digits(s) for s in fancy]
-    so = [normalize_digits(m.group(1)) for m in re.finditer(r"Sales\s*[\r\n ]*Order[\s:]*([0-9\s\u00A0\u202F\u2009\-]{4,12})", text, flags=re.I)]
-    cands = normal + fancy + so
-    cands = [c for c in cands if c.isdigit() and 4 <= len(c) <= 8]
-    out, seen = [], set()
-    for c in cands:
-        if c not in seen: out.append(c); seen.add(c)
-    return out
+    # Dopasowanie nagłówków „elastycznie”
+    header_row = {}
+    for c in range(1, ws.max_column + 1):
+        name = str(ws.cell(1, c).value or "").strip().lower()
+        if name:
+            header_row[name] = c
 
-def adaptive_crop_extra(text: str):
-    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
-    sparse = (len(lines) <= LOW_TEXT_LINES) or (len((text or "")) < SHORT_TEXT_CHARS)
-    if sparse: return (EXTRA_CROP_LR*mm, EXTRA_CROP_LR*mm, EXTRA_CROP_T*mm, EXTRA_CROP_B*mm)
-    return (0,0,0,0)
+    # Które kolumny nas interesują
+    col_z = header_row.get("zlecenie", header_row.get("nr zlecenia", 1))
+    col_i = (
+        header_row.get(
+            "ilość palet",
+            header_row.get(
+                "ilosc palet",
+                header_row.get("ilosc", header_row.get("ilość", 2)),
+            ),
+        )
+        or 2
+    )
+    col_p = (
+        header_row.get(
+            "przewoźnik",
+            header_row.get(
+                "przewoznik", header_row.get("przewoź", header_row.get("przewoz", 3))
+            ),
+        )
+        or 3
+    )
+    col_u = header_row.get("uwagi")  # może nie istnieć
 
-def make_overlay(width, height, header, footer, font_size=12, margin_mm=8):
-    buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=(width, height))
-    try: c.setFont("Helvetica-Bold", font_size)
-    except Exception: c.setFont("Helvetica", font_size)
-    m = margin_mm * mm
-    c.drawRightString(width - m, m + font_size + 1, header)
-    if footer: c.drawRightString(width - m, m, footer)
-    c.save(); return buf.getvalue()
+    rows: List[Dict[str, Any]] = []
+    zlecenia_set: Set[str] = set()
 
-def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
-    buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=(width, height))
-    W, H = width, height
-    try: c.setFont("Helvetica-Bold", 16)
-    except Exception: c.setFont("Helvetica", 16)
-    c.drawString(30, H-40, "RAPORT POROWNANIA DANYCH")
+    for r in range(2, ws.max_row + 1):
+        z = ws.cell(r, col_z).value if col_z else None
+        i = ws.cell(r, col_i).value if col_i else None
+        p = ws.cell(r, col_p).value if col_p else None
+        u = ws.cell(r, col_u).value if col_u else None
 
-    y = H-80
-    c.setFont("Helvetica-Bold", 12); c.drawString(30, y, "ZLECENIA Z EXCELA NIEZNALEZIONE W PDF:")
-    y -= 20; c.setFont("Helvetica-Bold", 10); c.drawString(30, y, "ZLECENIE"); 
-    y -= 12; c.setLineWidth(0.5); c.line(30, y, W-30, y); y -= 10
-    c.setFont("Helvetica", 10)
-    if not missing_from_pdf:
-        c.drawString(30, y, "(brak)"); y -= 16
+        if z is None and i is None and p is None and u is None:
+            continue
+
+        z_str = _to_str(z).strip()
+        i_int = _coerce_int(i)
+        p_str = _to_str(p).strip()
+        u_str = _to_str(u).strip()
+
+        if z_str:
+            zlecenia_set.add(z_str)
+
+        rows.append(
+            {
+                "zlecenie": z_str,
+                "ilosc": i_int,
+                "przewoznik": p_str,
+                "uwagi": u_str,
+            }
+        )
+
+    return rows, zlecenia_set
+
+
+def _register_fonts() -> str:
+    """Rejestruje font z polskimi znakami (jeśli dostępny)."""
+    try_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/local/share/fonts/DejaVuSans.ttf",
+        os.path.join(os.path.dirname(__file__), "DejaVuSans.ttf"),
+    ]
+    for p in try_paths:
+        if os.path.exists(p):
+            pdfmetrics.registerFont(TTFont("DejaVuSans", p))
+            return "DejaVuSans"
+    return "Helvetica"
+
+
+def _make_stamp_page(
+    zlecenie: str,
+    ilosc: int,
+    przewoznik: str,
+    uwagi: str,
+    width: float,
+    height: float,
+) -> bytes:
+    """Tworzy pojedynczą stronę z nadrukiem (overlay)."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(width, height), bottomup=True)
+    font_name = _register_fonts()
+    c.setAuthor("Kersia PDF Stamper")
+    c.setTitle(f"Zlecenie {zlecenie}")
+    c.setCreator("Kersia PDF Stamper (wersja z raportem)")
+
+    c.setFont(font_name, 14)
+    margin = 15 * mm
+    x = margin
+    y = height - margin
+
+    c.drawString(x, y, f"ZLECENIE: {zlecenie}")
+    y -= 8 * mm
+    c.drawString(x, y, f"ILOŚĆ PALET: {ilosc}")
+    y -= 8 * mm
+    c.drawString(x, y, f"PRZEWOŹNIK: {przewoznik}")
+    y -= 8 * mm
+    if uwagi:
+        c.drawString(x, y, f"UWAGI: {uwagi}")
+        y -= 8 * mm
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _extract_sales_orders_from_pdf(pdf_bytes: bytes) -> Set[str]:
+    """
+    Skanuje tekst z PDF i wyciąga numery „Sales order ...”.
+    Zwraca zbiór stringów.
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+    sales_orders: Set[str] = set()
+
+    pattern = re.compile(
+        r"sales\s*order[^\d]*(\d+)", re.IGNORECASE
+    )  # „Sales order 123456”, „Sales order: 123456” itd.
+
+    for page in reader.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        for match in pattern.finditer(text):
+            num = match.group(1).strip()
+            if num:
+                sales_orders.add(num)
+
+    return sales_orders
+
+
+def _make_report_page(
+    not_in_excel: List[str], width: float = 595.27, height: float = 841.89
+) -> bytes:
+    """
+    Tworzy stronę raportową na końcu:
+    „ZLECENIA Z PDF-A NIEZNALEZIONE W EXCELU”
+    """
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(width, height), bottomup=True)
+    font_name = _register_fonts()
+    c.setAuthor("Kersia PDF Stamper")
+    c.setTitle("Raport zleceń")
+    c.setCreator("Kersia PDF Stamper (raport)")
+
+    c.setFont(font_name, 16)
+    margin = 20 * mm
+    x = margin
+    y = height - margin
+    c.drawString(x, y, "ZLECENIA Z PDF-A NIEZNALEZIONE W EXCELU")
+    y -= 12 * mm
+
+    c.setFont(font_name, 12)
+
+    if not not_in_excel:
+        c.drawString(x, y, "Wszystkie numery Sales order z PDF występują w Excelu.")
     else:
-        for num in missing_from_pdf:
-            c.drawString(30, y, str(num)); y -= 14
-            if y < 80:
-                c.showPage(); y = H-60; c.setFont("Helvetica", 10)
+        for num in not_in_excel:
+            if y < margin:
+                c.showPage()
+                y = height - margin
+                c.setFont(font_name, 12)
+            c.drawString(x, y, f"- {num}")
+            y -= 7 * mm
 
-    if y < 140:
-        c.showPage(); y = H-60
+    c.showPage()
+    c.save()
+    return buf.getvalue()
 
-    c.setFont("Helvetica-Bold", 12); c.drawString(30, y, "ZLECENIA Z PDF-A NIEZNALEZIONE W EXCELU:")
-    y -= 20; c.setFont("Helvetica-Bold", 10); c.drawString(30, y, "ZLECENIE")
-    y -= 12; c.setLineWidth(0.5); c.line(30, y, W-30, y); y -= 10
-    c.setFont("Helvetica", 10)
-    if not missing_from_excel:
-        c.drawString(30, y, "(brak)"); y -= 16
-    else:
-        for num in missing_from_excel:
-            c.drawString(30, y, str(num)); y -= 14
-            if y < 60:
-                c.showPage(); y = H-60; c.setFont("Helvetica", 10)
 
-    c.save(); return buf.getvalue()
+# ----------------------- GŁÓWNA FUNKCJA -----------------------
 
-def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
-    lookup, excel_numbers = read_excel_lookup(io.BytesIO(xlsx_bytes))
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    groups, page_meta, page_text_cache = {}, {}, {}
-    found_in_pdf = set(); pdf_candidates_all = set()
+def annotate_pdf(pdf_bytes: bytes, excel_bytes: bytes, max_per_sheet: int = 3) -> bytes:
+    # 1. Parsujemy Excela
+    rows, excel_zlecenia = _parse_excel(excel_bytes)
+    if not rows:
+        raise ValueError(
+            "Nie znaleziono danych w Excelu. Upewnij się, że masz kolumny: ZLECENIE, ILOŚĆ PALET, PRZEWOŹNIK (i opcjonalnie UWAGI)."
+        )
 
-    for i, _ in enumerate(reader.pages):
-        page_text = extract_text(io.BytesIO(pdf_bytes), page_numbers=[i]) or ""
-        page_text_cache[i] = page_text
-        cands = extract_candidates(page_text)
-        for c in cands:
-            if c in excel_numbers: found_in_pdf.add(c)
-            else: pdf_candidates_all.add(c)
-        picked = next((n for n in cands if n in excel_numbers), None)
-        mapped = lookup.get(picked) if picked else None
-        if mapped:
-            z_full, il, pr = mapped
-            key = z_full
-            header = ("ZLECENIA (laczone): {}".format(strip_diacritics(z_full))
-                      if "+" in z_full else "ZLECENIE: {}".format(strip_diacritics(z_full)))
-            footer = "ilosc palet: {} | przewoznik: {}".format(strip_diacritics(il), strip_diacritics(pr))
-        elif picked:
-            key = picked; header = "ZLECENIE: {}".format(picked); footer = "(brak danych w Excelu)"
+    # 2. Zbieramy numery Sales order z PDF
+    pdf_sales_orders = _extract_sales_orders_from_pdf(pdf_bytes)
+
+    # 3. Tworzymy nowy PDF z nadrukami
+    reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+    writer = PdfWriter()
+    writer.add_metadata(
+        {
+            "/Producer": "Kersia PDF Stamper (PyPDF2 + ReportLab)",
+            "/Creator": "Kersia PDF Stamper (wersja z raportem)",
+            "/Title": "Zlecenia",
+        }
+    )
+
+    data_idx = 0
+    pages = list(reader.pages)
+
+    for page in pages:
+        w = float(page.mediabox.width)
+        h = float(page.mediabox.height)
+
+        # Na tej stronie nakładamy max_per_sheet wpisów z Excela
+        for _ in range(max_per_sheet):
+            if data_idx >= len(rows):
+                break
+            row = rows[data_idx]
+            data_idx += 1
+
+            overlay_bytes = _make_stamp_page(
+                row["zlecenie"], row["ilosc"], row["przewoznik"], row["uwagi"], w, h
+            )
+            overlay_reader = PdfReader(io.BytesIO(overlay_bytes), strict=False)
+            overlay_page = overlay_reader.pages[0]
+            page.merge_page(overlay_page)
+
+        writer.add_page(page)
+
+    # Jeżeli zostały wiersze z Excela, dorabiamy kolejne strony na bazie ostatniego rozmiaru
+    while data_idx < len(rows):
+        if pages:
+            w = float(pages[-1].mediabox.width)
+            h = float(pages[-1].mediabox.height)
         else:
-            key = "_NO_ORDER_{}".format(i+1); header = "(nie znaleziono numeru zlecenia na tej stronie)"; footer = ""
-        groups.setdefault(key, []).append(i); page_meta[i] = (header, footer)
+            # domyślnie A4 w punktach
+            w, h = (595.27, 841.89)
 
-    def key_sort(k: str):
-        import re; nums = [int(x) for x in re.findall(r"\d+", k)]; return (min(nums) if nums else 10**9, k)
-    ordered_keys = sorted(groups.keys(), key=key_sort)
+        blank = PageObject.create_blank_page(width=w, height=h)
 
-    W, H = A4
-    margin_x = SIDE_MARGIN_MM * mm; top_margin = TOP_MARGIN_MM * mm
-    bot_stamp = STAMP_BOTTOM_MM * mm; gap = INTER_GAP_MM * mm
-    avail_w = W - 2*margin_x; avail_h = H - top_margin - bot_stamp
-    base_crop_l = BASE_CROP_L*mm; base_crop_r = BASE_CROP_R*mm
-    base_crop_t = BASE_CROP_T*mm; base_crop_b = BASE_CROP_B*mm
+        for _ in range(max_per_sheet):
+            if data_idx >= len(rows):
+                break
+            row = rows[data_idx]
+            data_idx += 1
+            overlay_bytes = _make_stamp_page(
+                row["zlecenie"], row["ilosc"], row["przewoznik"], row["uwagi"], w, h
+            )
+            overlay_reader = PdfReader(io.BytesIO(overlay_bytes), strict=False)
+            overlay_page = overlay_reader.pages[0]
+            blank.merge_page(overlay_page)
 
-    writer = PdfWriter(); writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.6 (pypdf)"})
-    for gkey in ordered_keys:
-        idxs = groups[gkey]
-        for start in range(0, len(idxs), max_per_sheet):
-            batch = idxs[start:start+max_per_sheet]
-            items, total_h = [], 0.0
-            for idx in batch:
-                src = reader.pages[idx]
-                sw = float(src.mediabox.width); sh = float(src.mediabox.height)
-                ex_l, ex_r, ex_t, ex_b = adaptive_crop_extra(page_text_cache[idx])
-                cl = base_crop_l + ex_l; cr = base_crop_r + ex_r
-                ct = base_crop_t + ex_t; cb = base_crop_b + ex_b
-                cw = max(10.0, sw - cl - cr); ch = max(10.0, sh - ct - cb)
-                s  = avail_w / cw; dh = s * ch
-                items.append((idx, cl, cr, ct, cb, s, dh)); total_h += dh
-            total_h += gap * max(0, len(batch)-1)
-            down = min(1.0, avail_h / total_h) if total_h > 0 else 1.0
+        writer.add_page(blank)
 
-            writer.add_blank_page(width=W, height=H); base_page = writer.pages[-1]
-            y = H - top_margin
-            for (idx, cl, cr, ct, cb, s, dh) in items:
-                s *= down; dh *= down
-                x = margin_x - s * cl; y2 = y - dh
-                tmp = PageObject.create_blank_page(width=W, height=H)
-                tmp.merge_page(reader.pages[idx])
-                T = Transformation().translate(-cl, -cb).scale(s, s).translate(x, y2)
-                tmp.add_transformation(T); base_page.merge_page(tmp)
-                y = y2 - gap
+    # 4. Raport: zlecenia, które są w PDF (Sales order), ale NIE MA ich w Excelu
+    not_in_excel = sorted(pdf_sales_orders - excel_zlecenia, key=str)
+    report_bytes = _make_report_page(not_in_excel)
+    report_reader = PdfReader(io.BytesIO(report_bytes), strict=False)
+    for p in report_reader.pages:
+        writer.add_page(p)
 
-            ov = PdfReader(io.BytesIO(make_overlay(W, H, *page_meta[batch[0]])))
-            base_page.merge_page(ov.pages[0])
-
-    excel_missing = sorted(list(excel_numbers - found_in_pdf), key=lambda x: int(x)) if excel_numbers else []
-    pdf_only = sorted(list(pdf_candidates_all - excel_numbers), key=lambda x: int(x)) if pdf_candidates_all else []
-    rep = PdfReader(io.BytesIO(make_summary_page(W, H, excel_missing, pdf_only)))
-    writer.add_page(rep.pages[0])
-
-    buf = io.BytesIO(); writer.write(buf); buf.seek(0)
-    r2 = PdfReader(buf, strict=False); w2 = PdfWriter()
-    for p in r2.pages: w2.add_page(p)
-    out = io.BytesIO(); w2.write(out)
+    out = io.BytesIO()
+    writer.write(out)
     return out.getvalue()
 
-# ---- UI ----
-st.set_page_config(page_title="Kersia PDF Stamper v1.6 (Raport)", page_icon="🧰", layout="centered")
-st.title("Kersia — PDF Stamper (raport braków)")
-excel_file = st.file_uploader("Plik Excel:", type=["xlsx", "xlsm", "xls"])
-pdf_file = st.file_uploader("Plik PDF:", type=["pdf"])
-max_per_sheet = st.slider("Maks. stron na kartkę", 1, 6, 3, 1)
+
+# ----------------------- UI -----------------------
+
+st.markdown("Ta wersja dodaje stronę raportu oraz pole **UWAGI** z Excela na każdej etykiecie.")
+
+excel_file = st.file_uploader(
+    "Plik Excel (ZLECENIE, ilość palet, przewoźnik, opcjonalnie UWAGI):",
+    type=["xlsx", "xlsm", "xls"],
+)
+pdf_file = st.file_uploader(
+    "Plik PDF (szablon/strony z Sales order):",
+    type=["pdf"],
+)
+max_per_sheet = st.slider(
+    "Maks. wpisów na stronę PDF", min_value=1, max_value=6, value=3, step=1
+)
 
 if st.button("GENERUJ PDF", type="primary", disabled=not (excel_file and pdf_file)):
     try:
-        data = annotate_pdf_web(pdf_file.read(), excel_file.read(), max_per_sheet)
-        fname = "zlecenia_{}.pdf".format(datetime.now().strftime('%Y%m%d'))
-        st.success("Gotowe! Pobierz poniżej.")
-        st.download_button("Pobierz wynik", data=data, file_name=fname, mime="application/pdf")
+        result = annotate_pdf(pdf_file.read(), excel_file.read(), max_per_sheet)
+        fname = "zlecenia_{}.pdf".format(datetime.now().strftime("%Y%m%d"))
+        st.success("Gotowe! Poniżej przycisk pobierania.")
+        st.download_button(
+            "Pobierz wynik", data=result, file_name=fname, mime="application/pdf"
+        )
     except Exception as e:
-        st.error("Błąd: {}".format(repr(e)))
+        st.error(f"Błąd: {e}")
