@@ -33,31 +33,56 @@ def strip_diacritics(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", str(s)) if ord(c) < 128)
 
 def read_excel_lookup(file_like):
+    """
+    Odczyt Excela:
+      - wymagane kolumny: ZLECENIE, ilość palet, przewoźnik
+      - opcjonalne kolumny: UWAGI, DOK (osoba wprowadzająca zlecenie)
+    Zwraca:
+      lookup: numer -> (zlecenie, ilość palet, przewoźnik, uwagi, dok)
+      all_nums: zbiór wszystkich numerów z kolumny ZLECENIE
+    """
     wb = load_workbook(file_like, data_only=True); ws = wb.active
     headers = {}
     for col in range(1, ws.max_column + 1):
         v = ws.cell(row=1, column=col).value
-        if v is None: continue
+        if v is None:
+            continue
         headers[str(v).strip().lower()] = col
-    z_col = headers.get("zlecenie")
+
+    z_col   = headers.get("zlecenie")
     ilo_col = headers.get("ilośc palet") or headers.get("ilosc palet") or headers.get("ilość palet")
-    pr_col = headers.get("przewoźnik") or headers.get("przewoznik")
+    pr_col  = headers.get("przewoźnik") or headers.get("przewoznik")
+    uw_col  = headers.get("uwagi")   # opcjonalne
+    dok_col = headers.get("dok")     # opcjonalne
+
     if not z_col or not ilo_col or not pr_col:
         raise ValueError("Excel musi mieć kolumny: ZLECENIE, ilość palet, przewoźnik (nagłówki w 1. wierszu).")
-    lookup = {}; all_nums = set()
+
+    lookup = {}
+    all_nums = set()
+
     for row in range(2, ws.max_row + 1):
-        z = ws.cell(row=row, column=z_col).value
-        il = ws.cell(row=row, column=ilo_col).value
-        pr = ws.cell(row=row, column=pr_col).value
-        z = "" if z is None else str(z).strip()
-        il = "" if il is None else str(il).strip()
-        pr = "" if pr is None else str(pr).strip()
+        z   = ws.cell(row=row, column=z_col).value
+        il  = ws.cell(row=row, column=ilo_col).value
+        pr  = ws.cell(row=row, column=pr_col).value
+        uw  = ws.cell(row=row, column=uw_col).value if uw_col else None
+        dok = ws.cell(row=row, column=dok_col).value if dok_col else None
+
+        z   = "" if z   is None else str(z).strip()
+        il  = "" if il  is None else str(il).strip()
+        pr  = "" if pr  is None else str(pr).strip()
+        uw  = "" if uw  is None else str(uw).strip()
+        dok = "" if dok is None else str(dok).strip()
+
         parts = [p.strip() for p in re.split(r"[+;,/\s]+", z) if p.strip()]
         for p in parts:
             p2 = "".join(ch for ch in p if ch.isdigit())
             if p2.isdigit():
-                all_nums.add(p2); lookup[p2] = (z, il, pr)
+                all_nums.add(p2)
+                lookup[p2] = (z, il, pr, uw, dok)
+
     return lookup, all_nums
+
 
 NBSP = "\u00A0"; NNBSP = "\u202F"; THINSP = "\u2009"
 def normalize_digits(s: str) -> str:
@@ -83,41 +108,75 @@ def adaptive_crop_extra(text: str):
     if sparse: return (EXTRA_CROP_LR*mm, EXTRA_CROP_LR*mm, EXTRA_CROP_T*mm, EXTRA_CROP_B*mm)
     return (0,0,0,0)
 
-def make_overlay(width, height, header, footer, font_size=12, margin_mm=8):
+def make_overlay(width, height, header, footer, uwagi="", dok="", font_size=12, margin_mm=8):
+    """
+    Nadruk w prawym dolnym rogu:
+      1) nagłówek (ZLECENIE / ZLECENIA)
+      2) stopka (ilość palet | przewoźnik)
+      3) opcjonalnie: "uwagi: ..."
+      4) opcjonalnie: "DOK: ..." (kto wpisał zlecenie)
+    UWAGI i DOK są zwykłym tekstem (niepogrubione).
+    """
     buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=(width, height))
-    try: c.setFont("Helvetica-Bold", font_size)
-    except Exception: c.setFont("Helvetica", font_size)
+    try:
+        c.setFont("Helvetica-Bold", font_size)
+    except Exception:
+        c.setFont("Helvetica", font_size)
     m = margin_mm * mm
+
+    # 1) nagłówek
     c.drawRightString(width - m, m + font_size + 1, header)
-    if footer: c.drawRightString(width - m, m, footer)
+    # 2) stopka
+    if footer:
+        c.drawRightString(width - m, m, footer)
+
+    # 3) uwagi
+    y = m - (font_size + 1)
+    if uwagi:
+        try:
+            c.setFont("Helvetica", font_size - 1)
+        except Exception:
+            c.setFont("Helvetica", font_size)
+        c.drawRightString(width - m, y, "uwagi: {}".format(strip_diacritics(uwagi)))
+        y -= font_size
+
+    # 4) DOK
+    if dok:
+        try:
+            c.setFont("Helvetica", font_size - 1)
+        except Exception:
+            c.setFont("Helvetica", font_size)
+        c.drawRightString(width - m, y, "DOK: {}".format(strip_diacritics(dok)))
+
     c.save(); return buf.getvalue()
 
+
 def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
+    """
+    Raport końcowy:
+    - pokazujemy tylko: ZLECENIA Z PDF-A NIEZNALEZIONE W EXCELU
+    - sekcja "Z EXCELA NIEZNALEZIONE W PDF" została usunięta.
+    """
     buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=(width, height))
     W, H = width, height
-    try: c.setFont("Helvetica-Bold", 16)
-    except Exception: c.setFont("Helvetica", 16)
+    try:
+        c.setFont("Helvetica-Bold", 16)
+    except Exception:
+        c.setFont("Helvetica", 16)
     c.drawString(30, H-40, "RAPORT POROWNANIA DANYCH")
 
     y = H-80
-    c.setFont("Helvetica-Bold", 12); c.drawString(30, y, "ZLECENIA Z EXCELA NIEZNALEZIONE W PDF:")
-    y -= 20; c.setFont("Helvetica-Bold", 10); c.drawString(30, y, "ZLECENIE"); 
-    y -= 12; c.setLineWidth(0.5); c.line(30, y, W-30, y); y -= 10
-    c.setFont("Helvetica", 10)
-    if not missing_from_pdf:
-        c.drawString(30, y, "(brak)"); y -= 16
-    else:
-        for num in missing_from_pdf:
-            c.drawString(30, y, str(num)); y -= 14
-            if y < 80:
-                c.showPage(); y = H-60; c.setFont("Helvetica", 10)
 
-    if y < 140:
-        c.showPage(); y = H-60
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(30, y, "ZLECENIA Z PDF-A NIEZNALEZIONE W EXCELU:")
+    y -= 20
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(30, y, "ZLECENIE")
+    y -= 12
+    c.setLineWidth(0.5)
+    c.line(30, y, W-30, y)
+    y -= 10
 
-    c.setFont("Helvetica-Bold", 12); c.drawString(30, y, "ZLECENIA Z PDF-A NIEZNALEZIONE W EXCELU:")
-    y -= 20; c.setFont("Helvetica-Bold", 10); c.drawString(30, y, "ZLECENIE")
-    y -= 12; c.setLineWidth(0.5); c.line(30, y, W-30, y); y -= 10
     c.setFont("Helvetica", 10)
     if not missing_from_excel:
         c.drawString(30, y, "(brak)"); y -= 16
@@ -129,7 +188,10 @@ def make_summary_page(width, height, missing_from_pdf, missing_from_excel):
 
     c.save(); return buf.getvalue()
 
+
 def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
+    unknown_pdf_orders = []  # strony bez odczytanego numeru zlecenia
+
     lookup, excel_numbers = read_excel_lookup(io.BytesIO(xlsx_bytes))
     reader = PdfReader(io.BytesIO(pdf_bytes))
     groups, page_meta, page_text_cache = {}, {}, {}
@@ -144,17 +206,24 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             else: pdf_candidates_all.add(c)
         picked = next((n for n in cands if n in excel_numbers), None)
         mapped = lookup.get(picked) if picked else None
-        if mapped:
-            z_full, il, pr = mapped
-            key = z_full
-            header = ("ZLECENIA (laczone): {}".format(strip_diacritics(z_full))
-                      if "+" in z_full else "ZLECENIE: {}".format(strip_diacritics(z_full)))
-            footer = "ilosc palet: {} | przewoznik: {}".format(strip_diacritics(il), strip_diacritics(pr))
-        elif picked:
-            key = picked; header = "ZLECENIE: {}".format(picked); footer = "(brak danych w Excelu)"
-        else:
-            key = "_NO_ORDER_{}".format(i+1); header = "(nie znaleziono numeru zlecenia na tej stronie)"; footer = ""
-        groups.setdefault(key, []).append(i); page_meta[i] = (header, footer)
+if mapped:
+    # lookup: numer -> (zlecenie, ilość palet, przewoźnik, uwagi, dok)
+    if len(mapped) == 5:
+        z_full, il, pr, uw, dok = mapped
+    else:
+        z_full, il, pr = mapped
+        uw = ""; dok = ""
+    key = z_full
+    header = ("ZLECENIA (laczone): {}".format(strip_diacritics(z_full))
+              if "+" in z_full else "ZLECENIE: {}".format(strip_diacritics(z_full)))
+    footer = "ilosc palet: {} | przewoznik: {}".format(strip_diacritics(il), strip_diacritics(pr))
+elif picked:
+    key = picked; header = "ZLECENIE: {}".format(picked); footer = "(brak danych w Excelu)"; uw = ""; dok = ""
+else:
+    key = "_NO_ORDER_{}".format(i+1); header = "(nie znaleziono numeru zlecenia na tej stronie)"; footer = ""; uw = ""; dok = ""
+    unknown_pdf_orders.append(f"STRONA_{i+1}")
+groups.setdefault(key, []).append(i); page_meta[i] = (header, footer, uw, dok)
+
 
     def key_sort(k: str):
         import re; nums = [int(x) for x in re.findall(r"\d+", k)]; return (min(nums) if nums else 10**9, k)
@@ -199,19 +268,11 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             ov = PdfReader(io.BytesIO(make_overlay(W, H, *page_meta[batch[0]])))
             base_page.merge_page(ov.pages[0])
 
-    excel_missing = sorted(list(excel_numbers - found_in_pdf), key=lambda x: int(x)) if excel_numbers else []
-    pdf_only = sorted(list(pdf_candidates_all - excel_numbers), key=lambda x: int(x)) if pdf_candidates_all else []
-    rep = PdfReader(io.BytesIO(make_summary_page(W, H, excel_missing, pdf_only)))
-    writer.add_page(rep.pages[0])
-
-    buf = io.BytesIO(); writer.write(buf); buf.seek(0)
-    r2 = PdfReader(buf, strict=False); w2 = PdfWriter()
-    for p in r2.pages: w2.add_page(p)
-    out = io.BytesIO(); w2.write(out)
-    return out.getvalue()
+            buf = io.BytesIO(); writer.write(buf); buf.seek(0)
+    return buf.getvalue()
 
 # ---- UI ----
-st.set_page_config(page_title="Kersia PDF Stamper v1.6 (Raport)", page_icon="🧰", layout="centered")
+.set_page_config(page_title="Kersia PDF Stamper v1.6 (Raport)", page_icon="🧰", layout="centered")
 st.title("Kersia — PDF Stamper (raport braków)")
 excel_file = st.file_uploader("Plik Excel:", type=["xlsx", "xlsm", "xls"])
 pdf_file = st.file_uploader("Plik PDF:", type=["pdf"])
