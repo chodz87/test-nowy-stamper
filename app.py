@@ -26,11 +26,15 @@ EXTRA_CROP_LR = 14
 EXTRA_CROP_T  = 18
 EXTRA_CROP_B  = 28
 
-def strip_diacritics(s: str) -> str:
+def strip_diacritics(s):
     import unicodedata
-    if s is None:
-        return ""
-    return "".join(c for c in unicodedata.normalize("NFKD", str(s)) if ord(c) < 128)
+    # ręczne poprawki dla ł/Ł
+    s = s.replace("ł", "l").replace("Ł", "L")
+    # standardowa normalizacja
+    s_norm = unicodedata.normalize("NFD", s)
+    s_clean = ''.join(c for c in s_norm if unicodedata.category(c) != "Mn")
+    return s_clean
+
 
 def read_excel_lookup(file_like):
     """
