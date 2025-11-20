@@ -196,10 +196,13 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
         page_text_cache[i] = page_text
         cands = extract_candidates(page_text)
         for c in cands:
-            if c in excel_numbers: found_in_pdf.add(c)
-            else: pdf_candidates_all.add(c)
-        picked = next((n for n in cands if n in excel_numbers), None)
-        mapped = lookup.get(picked) if picked else None
+            if c in excel_numbers:
+                found_in_pdf.add(c)
+            else:
+                pdf_candidates_all.add(c)
+        picked_excel = next((n for n in cands if n in excel_numbers), None)
+        picked_any = picked_excel or (cands[0] if cands else None)
+        mapped = lookup.get(picked_excel) if picked_excel else None
         if mapped:
             # lookup: numer -> (zlecenie, ilość palet, przewoźnik, uwagi, dok)
             if len(mapped) == 5:
@@ -211,11 +214,12 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             header = ("ZLECENIA (laczone): {}".format(strip_diacritics(z_full))
                       if "+" in z_full else "ZLECENIE: {}".format(strip_diacritics(z_full)))
             footer = "ilosc palet: {} | przewoznik: {}".format(strip_diacritics(il), strip_diacritics(pr))
-        elif picked:
-            key = picked; header = "ZLECENIE: {}".format(picked); footer = "(brak danych w Excelu)"; uw = ""; dok = ""
+        elif picked_any:
+            key = picked_any; header = "ZLECENIE: {}".format(picked_any); footer = "(brak danych w Excelu)"; uw = ""; dok = ""
         else:
             key = "_NO_ORDER_{}".format(i+1); header = "(nie znaleziono numeru zlecenia na tej stronie)"; footer = ""; uw = ""; dok = ""
         groups.setdefault(key, []).append(i); page_meta[i] = (header, footer, uw, dok)
+
 
     def key_sort(k: str):
         import re; nums = [int(x) for x in re.findall(r"\d+", k)]; return (min(nums) if nums else 10**9, k)
