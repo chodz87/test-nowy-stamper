@@ -26,11 +26,16 @@ EXTRA_CROP_LR = 14
 EXTRA_CROP_T  = 18
 EXTRA_CROP_B  = 28
 
+NBSP = "\u00A0"; NNBSP = "\u202F"; THINSP = "\u2009"
+
 def strip_diacritics(s: str) -> str:
     import unicodedata
     if s is None:
         return ""
     return "".join(c for c in unicodedata.normalize("NFKD", str(s)) if ord(c) < 128)
+
+def normalize_digits(s: str) -> str:
+    return re.sub(r"[\\s\\-{}{}{}]".format(NBSP, NNBSP, THINSP), "", s)
 
 def read_excel_lookup(file_like):
     """
@@ -69,7 +74,7 @@ def read_excel_lookup(file_like):
         pr = "" if pr is None else str(pr).strip()
         uw = "" if uw is None else str(uw).strip()
 
-        parts = [p.strip() for p in re.split(r"[+;,/\s]+", z) if p.strip()]
+        parts = [p.strip() for p in re.split(r"[+;,/\\s]+", z) if p.strip()]
         for p in parts:
             p2 = "".join(ch for ch in p if ch.isdigit())
             if p2.isdigit():
@@ -78,21 +83,15 @@ def read_excel_lookup(file_like):
 
     return lookup, all_nums
 
-NBSP = "\u00A0"; NNBSP = "\u202F"; THINSP = "\u2009"
-def normalize_digits(s: str) -> str:
-    import re
-    return re.sub(r"[\s\-{}{}{}]".format(NBSP, NNBSP, THINSP), "", s)
-
 def extract_candidates(text: str):
     """
     Numery używane do przypisania stron do zleceń.
     """
-    import re
-    normal = re.findall(r"\b\d{4,8}\b", text)
-    fancy = re.findall(r"(?<!\d)(?:\d[\s\u00A0\u202F\u2009\-]?){4,9}(?!\d)", text)
+    normal = re.findall(r"\\b\\d{3,9}\\b", text)
+    fancy = re.findall(r"(?<!\\d)(?:\\d[\\s\\u00A0\\u202F\\u2009\\-]?){3,9}(?!\\d)", text)
     fancy = [normalize_digits(s) for s in fancy]
     so = [normalize_digits(m.group(1)) for m in re.finditer(
-        r"Sales\s*[\r\n ]*Order[\s:]*([0-9\s\u00A0\u202F\u2009\-]{4,12})",
+        r"Sales\\s*[\\r\\n ]*Order[\\s:]*([0-9\\s\\u00A0\\u202F\\u2009\\-]{3,16})",
         text,
         flags=re.I,
     )]
@@ -106,13 +105,14 @@ def extract_candidates(text: str):
 
 def extract_all_numbers_from_pdf(all_text: str):
     """
-    Bardzo prosty skan po całym tekście PDF:
-    zwraca wszystkie sekwencje 3-9 cyfr.
-    To ma zapewnić, że numery takie jak 55667, 55226 itd.
-    na pewno trafią do raportu 'Z PDF-A NIEZNALEZIONE W EXCELU'.
+    Szeroki skan całego tekstu PDF:
+    - łapie ciągi cyfr 3-9 znaków
+    - oraz warianty z odstępami / NBSP / myślnikami pomiędzy.
     """
-    nums = re.findall(r"(?<!\d)(\d{3,9})(?!\d)", all_text)
-    return {n for n in nums if n.isdigit()}
+    pattern = r"(?<!\\d)(?:\\d[\\s\\u00A0\\u202F\\u2009\\-]?){3,9}(?!\\d)"
+    raw = re.findall(pattern, all_text)
+    nums = {normalize_digits(s) for s in raw}
+    return {n for n in nums if n.isdigit() and 3 <= len(n) <= 9}
 
 def adaptive_crop_extra(text: str):
     lines = [ln for ln in (text or "").splitlines() if ln.strip()]
@@ -233,8 +233,7 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
         page_meta[i] = (header, footer, uw)
 
     def key_sort(k: str):
-        import re
-        nums = [int(x) for x in re.findall(r"\d+", k)]
+        nums = [int(x) for x in re.findall(r"\\d+", k)]
         return (min(nums) if nums else 10**9, k)
 
     ordered_keys = sorted(groups.keys(), key=key_sort)
@@ -252,7 +251,7 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     base_crop_b = BASE_CROP_B*mm
 
     writer = PdfWriter()
-    writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.7c (pypdf, uwagi + raport pełne numery)"})
+    writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.7d (pypdf, uwagi + raport szerokie numery)"})
 
     for gkey in ordered_keys:
         idxs = groups[gkey]
@@ -297,16 +296,15 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             base_page.merge_page(ov.pages[0])
 
     # --- RAPORT KOŃCOWY ---
-    # Korzystamy z bardzo prostego skanu całego PDF-a, żeby złapać wszystkie sekwencje cyfr.
-    full_text = "\n".join(all_text_parts)
+    full_text = "\\n".join(all_text_parts)
     pdf_all_extra = extract_all_numbers_from_pdf(full_text)
-
     pdf_all = found_in_pdf.union(pdf_candidates_all).union(pdf_all_extra)
+
     if excel_numbers:
-        excel_missing = sorted([n for n in excel_numbers if n not in pdf_all], key=lambda x: int(x))
+        excel_missing = sorted([n for n in excel_numbers if n not in pdf_all], key=int)
     else:
         excel_missing = []
-    pdf_only = sorted([n for n in pdf_all if n not in excel_numbers], key=lambda x: int(x))
+    pdf_only = sorted([n for n in pdf_all if n not in excel_numbers], key=int)
 
     rep = PdfReader(io.BytesIO(make_summary_page(W, H, excel_missing, pdf_only)))
     writer.add_page(rep.pages[0])
@@ -323,7 +321,7 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     return out.getvalue()
 
 # ---- UI ----
-st.set_page_config(page_title="Kersia PDF Stamper v1.7c (Raport + UWAGI)", page_icon="🧰", layout="centered")
+st.set_page_config(page_title="Kersia PDF Stamper v1.7d (Raport + UWAGI)", page_icon="🧰", layout="centered")
 st.title("Kersia — PDF Stamper (raport braków + uwagi)")
 excel_file = st.file_uploader("Plik Excel:", type=["xlsx", "xlsm", "xls"])
 pdf_file = st.file_uploader("Plik PDF:", type=["pdf"])
