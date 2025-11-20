@@ -69,13 +69,11 @@ def read_excel_lookup(file_like):
         pr = "" if pr is None else str(pr).strip()
         uw = "" if uw is None else str(uw).strip()
 
-        # rozbijamy zlecenie po separatorach i wyciągamy numery
         parts = [p.strip() for p in re.split(r"[+;,/\s]+", z) if p.strip()]
         for p in parts:
             p2 = "".join(ch for ch in p if ch.isdigit())
             if p2.isdigit():
                 all_nums.add(p2)
-                # zapisujemy również uwagi
                 lookup[p2] = (z, il, pr, uw)
 
     return lookup, all_nums
@@ -98,18 +96,6 @@ def extract_candidates(text: str):
         if c not in seen:
             out.append(c); seen.add(c)
     return out
-
-def extract_sales_orders(text: str):
-    """
-    Zwraca numery, które występują bezpośrednio przy 'Sales order' w PDF.
-    Używane tylko do raportu na ostatniej stronie, żeby nie brać przypadkowych cyfr.
-    """
-    so = [normalize_digits(m.group(1)) for m in re.finditer(
-        r"Sales\s*[\r\n ]*Order[\s:]*([0-9\s\u00A0\u202F\u2009\-]{4,12})",
-        text,
-        flags=re.I
-    )]
-    return {c for c in so if c.isdigit() and 4 <= len(c) <= 8}
 
 def adaptive_crop_extra(text: str):
     lines = [ln for ln in (text or "").splitlines() if ln.strip()]
@@ -135,12 +121,9 @@ def make_overlay(width, height, header, footer, uwagi="", font_size=12, margin_m
         c.setFont("Helvetica", font_size)
     m = margin_mm * mm
 
-    # linia nagłówka jak wcześniej
     c.drawRightString(width - m, m + font_size + 1, header)
-    # linia stopki jak wcześniej
     if footer:
         c.drawRightString(width - m, m, footer)
-    # dodatkowa linia z uwagami pod stopką (jeśli są)
     if uwagi:
         try:
             c.setFont("Helvetica", font_size - 1)
@@ -194,13 +177,11 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     groups, page_meta, page_text_cache = {}, {}, {}
     found_in_pdf = set()
     pdf_candidates_all = set()
-    pdf_sales_orders = set()   # numery występujące konkretnie przy 'Sales order' w PDF
 
     for i, _ in enumerate(reader.pages):
         page_text = extract_text(io.BytesIO(pdf_bytes), page_numbers=[i]) or ""
         page_text_cache[i] = page_text
 
-        # wszystkie potencjalne numery (jak wcześniej) – dla dopasowania stron
         cands = extract_candidates(page_text)
         for c in cands:
             if c in excel_numbers:
@@ -208,13 +189,9 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             else:
                 pdf_candidates_all.add(c)
 
-        # DODANE: numery przy 'Sales order' tylko do raportu
-        pdf_sales_orders.update(extract_sales_orders(page_text))
-
         picked = next((n for n in cands if n in excel_numbers), None)
         mapped = lookup.get(picked) if picked else None
         if mapped:
-            # w lookup trzymamy (zlecenie, ilość, przewoźnik, uwagi)
             if len(mapped) == 4:
                 z_full, il, pr, uw = mapped
             else:
@@ -236,7 +213,6 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             uw = ""
 
         groups.setdefault(key, []).append(i)
-        # ZAPAMIĘTUJEMY TAKŻE UWAGI
         page_meta[i] = (header, footer, uw)
 
     def key_sort(k: str):
@@ -259,7 +235,7 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     base_crop_b = BASE_CROP_B*mm
 
     writer = PdfWriter()
-    writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.7 (pypdf, uwagi + poprawiony raport)"})
+    writer.add_metadata({"/Producer": "Kersia PDF Stamper v1.7b (pypdf, uwagi + poprawiony raport 2)"})
 
     for gkey in ordered_keys:
         idxs = groups[gkey]
@@ -304,21 +280,16 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
             base_page.merge_page(ov.pages[0])
 
     # --- RAPORT KOŃCOWY ---
-    # 1) Z Excela, których nie znaleziono w PDF (przy 'Sales order')
-    if pdf_sales_orders:
-        excel_missing = sorted(
-            [n for n in excel_numbers if n not in pdf_sales_orders],
-            key=lambda x: int(x)
-        )
-        # 2) Z PDF (przy 'Sales order'), których nie ma w Excelu
-        pdf_only = sorted(
-            [n for n in pdf_sales_orders if n not in excel_numbers],
-            key=lambda x: int(x)
-        )
+    # ZLECENIA Z EXCELA NIEZNALEZIONE W PDF
+    # i ZLECENIA Z PDF-A NIEZNALEZIONE W EXCELU
+    # liczymy teraz na podstawie WSZYSTKICH kandydatów z PDF (extract_candidates),
+    # żeby łapać także numery takie jak 55667, 55226 itp.
+    pdf_all = found_in_pdf.union(pdf_candidates_all)
+    if excel_numbers:
+        excel_missing = sorted([n for n in excel_numbers if n not in pdf_all], key=lambda x: int(x))
     else:
-        # jeśli nie znaleziono żadnych 'Sales order', zachowujemy stare zachowanie
-        excel_missing = sorted(list(excel_numbers - found_in_pdf), key=lambda x: int(x)) if excel_numbers else []
-        pdf_only = sorted(list(pdf_candidates_all - excel_numbers), key=lambda x: int(x)) if pdf_candidates_all else []
+        excel_missing = []
+    pdf_only = sorted([n for n in pdf_all if n not in excel_numbers], key=lambda x: int(x))
 
     rep = PdfReader(io.BytesIO(make_summary_page(W, H, excel_missing, pdf_only)))
     writer.add_page(rep.pages[0])
@@ -335,7 +306,7 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     return out.getvalue()
 
 # ---- UI ----
-st.set_page_config(page_title="Kersia PDF Stamper v1.7 (Raport + UWAGI)", page_icon="🧰", layout="centered")
+st.set_page_config(page_title="Kersia PDF Stamper v1.7b (Raport + UWAGI)", page_icon="🧰", layout="centered")
 st.title("Kersia — PDF Stamper (raport braków + uwagi)")
 excel_file = st.file_uploader("Plik Excel:", type=["xlsx", "xlsm", "xls"])
 pdf_file = st.file_uploader("Plik PDF:", type=["pdf"])
