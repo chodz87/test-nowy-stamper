@@ -92,6 +92,23 @@ def normalize_digits(s: str) -> str:
     import re
     return re.sub(r"[\s\-{}{}{}]".format(NBSP, NNBSP, THINSP), "", s)
 
+
+def is_effectively_blank_page(text: str) -> bool:
+    import re
+    if not text:
+        return True
+    t = " ".join(text.split()).lower()
+    boiler = [
+        "movement request pick slip","report date","page ","end of report",
+        "oracle","niepruszewo","input parameters"
+    ]
+    for b in boiler:
+        t = t.replace(b,"")
+    t = t.strip()
+    if not any(ch.isdigit() for ch in t) and len(t)<40:
+        return True
+    return False
+
 def extract_candidates(text: str):
     import re
     normal = re.findall(r"\b\d{4,8}\b", text)
@@ -232,6 +249,9 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
     for i in range(1, len(reader.pages)):
         page_text = extract_text(io.BytesIO(pdf_bytes), page_numbers=[i]) or ""
         page_text_cache[i] = page_text
+        # skip blank pages
+        if is_effectively_blank_page(page_text):
+            continue
 
         cands = extract_candidates(page_text)
 
