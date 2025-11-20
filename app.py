@@ -270,9 +270,20 @@ def annotate_pdf_web(pdf_bytes, xlsx_bytes, max_per_sheet):
 
     # --- sortowanie grup po numerach zleceń ---
     def key_sort(k: str):
+        """
+        Sortowanie grup:
+        - NAJPIERW zlecenia nieznalezione w Excelu (PDF-only oraz _NO_ORDER_)
+        - potem zlecenia powiązane z Excelem
+        W każdej z tych dwóch grup sortujemy rosnąco po numerze zlecenia.
+        """
         import re
-        nums = [int(x) for x in re.findall(r"\d+", k)]
-        return (min(nums) if nums else 10**9, k)
+        nums_str = re.findall(r"\d+", k)
+        nums_int = [int(x) for x in nums_str] if nums_str else []
+        # czy ten klucz ma numer występujący w Excelu?
+        has_excel = any(n in excel_numbers for n in nums_str)
+        group_flag = 1 if has_excel else 0  # 0 = PDF-only / NO_ORDER, 1 = z Excela
+        primary = min(nums_int) if nums_int else 10**9
+        return (group_flag, primary, k)
 
     ordered_keys = sorted(groups.keys(), key=key_sort)
 
